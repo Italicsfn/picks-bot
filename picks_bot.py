@@ -3,11 +3,9 @@ import discord
 from discord.ext import commands, tasks
 import aiohttp
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
-# ============================================
-# PASTE YOUR KEYS HERE
 # ============================================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
@@ -23,13 +21,6 @@ SPORTS = [
     "baseball_mlb",
     "icehockey_nhl",
 ]
-
-PROP_SPORTS = {
-    "basketball_nba": "basketball_nba",
-    "americanfootball_nfl": "americanfootball_nfl",
-    "baseball_mlb": "baseball_mlb",
-    "icehockey_nhl": "icehockey_nhl",
-}
 
 SPORT_EMOJIS = {
     "basketball_nba": "🏀",
@@ -52,9 +43,43 @@ PROP_MARKETS = {
     "icehockey_nhl": ["player_goals", "player_assists"],
 }
 
+# Store today's picks for results tracking
+todays_picks = []
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+def american_to_prob(odds):
+    """Convert American odds to implied probability %"""
+    if odds < 0:
+        prob = (-odds) / (-odds + 100) * 100
+    else:
+        prob = 100 / (odds + 100) * 100
+    return round(prob, 1)
+
+
+def format_odds(price):
+    if price > 0:
+        return f"+{price}"
+    return str(price)
+
+
+def get_prop_label(market_key):
+    labels = {
+        "player_points": "Points",
+        "player_rebounds": "Rebounds",
+        "player_assists": "Assists",
+        "player_pass_tds": "Pass TDs",
+        "player_pass_yds": "Pass Yards",
+        "player_rush_yds": "Rush Yards",
+        "player_reception_yds": "Rec Yards",
+        "batter_hits": "Hits",
+        "pitcher_strikeouts": "Strikeouts",
+        "player_goals": "Goals",
+    }
+    return labels.get(market_key, market_key)
 
 
 async def fetch_odds(sport):
@@ -62,9 +87,23 @@ async def fetch_odds(sport):
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "us",
-        "markets": "h2h,spreads,totals",
+        "markets": "h2h",
         "oddsFormat": "american",
         "dateFormat": "iso",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return []
+
+
+async def fetch_scores(sport):
+    """Fetch completed game scores"""
+    url = f"https://api.the-odds-api.com/v4/sports/{sport}/scores"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "daysFrom": 1,
     }
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
@@ -103,28 +142,6 @@ def get_best_pick(game):
     return None, None
 
 
-def format_odds(price):
-    if price > 0:
-        return f"+{price}"
-    return str(price)
-
-
-def get_prop_label(market_key):
-    labels = {
-        "player_points": "Points",
-        "player_rebounds": "Rebounds",
-        "player_assists": "Assists",
-        "player_pass_tds": "Pass TDs",
-        "player_pass_yds": "Pass Yards",
-        "player_rush_yds": "Rush Yards",
-        "player_reception_yds": "Rec Yards",
-        "batter_hits": "Hits",
-        "pitcher_strikeouts": "Strikeouts",
-        "player_goals": "Goals",
-    }
-    return labels.get(market_key, market_key)
-
-
 async def build_picks_embed(sport):
     games = await fetch_odds(sport)
     emoji = SPORT_EMOJIS[sport]
@@ -144,6 +161,7 @@ async def build_picks_embed(sport):
     for game in games[:5]:
         home = game.get("home_team", "?")
         away = game.get("away_team", "?")
+        game_id = game.get("id", "")
         favorite, underdog = get_best_pick(game)
 
         if not favorite:
@@ -151,12 +169,26 @@ async def build_picks_embed(sport):
 
         fav_odds = format_odds(favorite["price"])
         dog_odds = format_odds(underdog["price"]) if underdog else "N/A"
+        fav_prob = american_to_prob(favorite["price"])
+        dog_prob = american_to_prob(underdog["price"]) if underdog else 0
+
+        # Store pick for results tracking
+        todays_picks.append({
+            "sport": sport,
+            "game_id": game_id,
+            "home": home,
+            "away": away,
+            "pick": favorite["name"],
+            "odds": favorite["price"],
+            "prob": fav_prob,
+        })
 
         embed.add_field(
             name=f"🏟️ {away} @ {home}",
             value=(
                 f"✅ **Pick: {favorite['name']}** ({fav_odds})\n"
-                f"📊 Underdog: {underdog['name'] if underdog else 'N/A'} ({dog_odds})"
+                f"📈 Hit Probability: **{fav_prob}%**\n"
+                f"📊 Underdog: {underdog['name'] if underdog else 'N/A'} ({dog_odds}) — {dog_prob}%"
             ),
             inline=False,
         )
@@ -185,7 +217,7 @@ async def build_props_embed(sport):
     embed.set_footer(text="Player props | Gamble responsibly 🎯")
 
     count = 0
-    for game in games[:2]:  # Only first 2 games to save API calls
+    for game in games[:2]:
         event_id = game.get("id")
         home = game.get("home_team", "?")
         away = game.get("away_team", "?")
@@ -204,9 +236,12 @@ async def build_props_embed(sport):
                 for outcome in market.get("outcomes", [])[:2]:
                     player = outcome.get("description", outcome.get("name", "?"))
                     point = outcome.get("point", "")
-                    price = format_odds(outcome["price"])
+                    price = outcome["price"]
+                    prob = american_to_prob(price)
                     side = outcome["name"]
-                    prop_lines.append(f"**{player}** {label} {side} {point} ({price})")
+                    prop_lines.append(
+                        f"**{player}** {label} {side} {point} ({format_odds(price)}) — {prob}%"
+                    )
 
         if prop_lines:
             embed.add_field(
@@ -223,7 +258,71 @@ async def build_props_embed(sport):
     return embed
 
 
+async def build_results_embed(sport):
+    scores = await fetch_scores(sport)
+    emoji = SPORT_EMOJIS[sport]
+    name = SPORT_NAMES[sport]
+
+    if not scores:
+        return None
+
+    completed = [g for g in scores if g.get("completed")]
+    if not completed:
+        return None
+
+    embed = discord.Embed(
+        title=f"{emoji} {name} Yesterday's Results",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow(),
+    )
+    embed.set_footer(text="Pick results from yesterday's games")
+
+    count = 0
+    for game in completed[:5]:
+        home = game.get("home_team", "?")
+        away = game.get("away_team", "?")
+        game_id = game.get("id", "")
+        scores_data = game.get("scores", [])
+
+        if not scores_data or len(scores_data) < 2:
+            continue
+
+        # Find winner
+        team1 = scores_data[0]
+        team2 = scores_data[1]
+        try:
+            score1 = float(team1.get("score", 0))
+            score2 = float(team2.get("score", 0))
+            winner = team1["name"] if score1 > score2 else team2["name"]
+            score_str = f"{team1['name']} {int(score1)} - {int(score2)} {team2['name']}"
+        except Exception:
+            continue
+
+        # Check if we had a pick on this game
+        pick_info = next((p for p in todays_picks if p["game_id"] == game_id), None)
+
+        if pick_info:
+            hit = pick_info["pick"] == winner
+            result_emoji = "✅ HIT" if hit else "❌ MISS"
+            pick_text = f"{result_emoji} — Picked **{pick_info['pick']}** ({format_odds(pick_info['odds'])}) | {pick_info['prob']}% prob"
+        else:
+            pick_text = f"🏆 Winner: **{winner}**"
+
+        embed.add_field(
+            name=f"🏟️ {score_str}",
+            value=pick_text,
+            inline=False,
+        )
+        count += 1
+
+    if count == 0:
+        return None
+
+    return embed
+
+
 async def post_picks():
+    todays_picks.clear()
     for guild in bot.guilds:
         channel = discord.utils.get(guild.text_channels, name=PICKS_CHANNEL_NAME)
         if not channel:
@@ -283,6 +382,21 @@ async def manual_picks(ctx):
 async def manual_props(ctx):
     await ctx.send("🔍 Fetching today's player props...")
     await post_props()
+
+
+@bot.command(name="results")
+async def manual_results(ctx):
+    """Show yesterday's results and whether picks hit"""
+    await ctx.send("🔍 Fetching yesterday's results...")
+    any_results = False
+    for sport in SPORTS:
+        embed = await build_results_embed(sport)
+        if embed:
+            await ctx.send(embed=embed)
+            any_results = True
+            await asyncio.sleep(1)
+    if not any_results:
+        await ctx.send("⚠️ No completed games found from yesterday yet.")
 
 
 bot.run(DISCORD_TOKEN)
