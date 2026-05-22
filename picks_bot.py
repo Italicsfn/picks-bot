@@ -1,4 +1,4 @@
-import discord
+import os
 from discord.ext import commands, tasks
 import aiohttp
 import asyncio
@@ -8,8 +8,8 @@ import pytz
 # ============================================
 # PASTE YOUR KEYS HERE
 # ============================================
-DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
-ODDS_API_KEY = "YOUR_ODDS_API_KEY_HERE"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 PICKS_CHANNEL_NAME = "sports-picks"  # Change if your channel name is different
 POST_HOUR = 9       # 9 AM
 POST_MINUTE = 0
